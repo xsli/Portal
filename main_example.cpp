@@ -12,6 +12,30 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <iostream>
 #include <vector>
+#include <string>
+
+// ============================================================================
+// RenderDoc Debug Markers
+// ============================================================================
+// 用于在 RenderDoc 中显示渲染事件层级
+void PushDebugGroup(const char* name) {
+    if (glPushDebugGroup) {
+        glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, 0, -1, name);
+    }
+}
+
+void PopDebugGroup() {
+    if (glPopDebugGroup) {
+        glPopDebugGroup();
+    }
+}
+
+// 带格式化的调试组
+void PushDebugGroupF(const char* format, int value) {
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), format, value);
+    PushDebugGroup(buffer);
+}
 
 const int WINDOW_WIDTH = 1280;
 const int WINDOW_HEIGHT = 720;
@@ -813,6 +837,10 @@ int GetPortalViewingSide(PortalRenderer::Portal* portal, const glm::vec3& camera
     return glm::dot(toCamera, portalNormal) > 0.0f ? 1 : -1;
 }
 
+// 前向声明
+void RenderPortalFramesExcluding(const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix, 
+                                  float time, PortalRenderer::Portal* excludePortal);
+
 // 渲染单个门户的内容（递归，支持双面门户）
 // viewingSide: 1 = 从正面观察, -1 = 从背面观察
 void RenderPortalContent(PortalRenderer::Portal* portal, 
@@ -825,13 +853,15 @@ void RenderPortalContent(PortalRenderer::Portal* portal,
                          int viewingSide = 1);
 
 // 递归渲染所有门户（双面门户版本）
+// excludePortal: 排除的门户（正在通过的门户，避免在递归中重复渲染）
 void RenderPortalsRecursive(const glm::mat4& viewMatrix, 
                             const glm::mat4& projectionMatrix,
                             const glm::vec3& cameraPos,
                             const glm::vec3& cameraForward,
                             int recursionLevel,
                             int stencilValue,
-                            float currentTime) {
+                            float currentTime,
+                            PortalRenderer::Portal* excludePortal = nullptr) {
     if (recursionLevel >= MAX_PORTAL_RECURSION) {
         return;
     }
@@ -841,15 +871,27 @@ void RenderPortalsRecursive(const glm::mat4& viewMatrix,
         
         if (!portal->isActive || !portal->linkedPortal) continue;
         
-        // 检查门户可见性
-        if (!IsPortalVisible(portal, cameraPos, cameraForward)) continue;
+        // 关键修复：排除当前正在通过的门户对
+        // 当通过门户A看时，不应该再在L1中渲染门户A或门户B
+        // 因为我们已经"在"门户B的出口了，再次渲染会导致位置错误
+        if (excludePortal != nullptr) {
+            if (portal == excludePortal || portal == excludePortal->linkedPortal) {
+                continue;
+            }
+        }
+        
+        // 从当前视图矩阵提取实际相机位置（支持递归层级）
+        glm::vec3 actualCameraPos = glm::vec3(glm::inverse(viewMatrix)[3]);
+        
+        // 检查门户可见性（使用实际相机位置）
+        if (!IsPortalVisible(portal, actualCameraPos, cameraForward)) continue;
         
         // 双面门户：从两面都可以看到对面场景
-        // 获取当前观察的是哪一面
-        int viewingSide = GetPortalViewingSide(portal, cameraPos);
+        // 获取当前观察的是哪一面（使用实际相机位置）
+        int viewingSide = GetPortalViewingSide(portal, actualCameraPos);
         
-        // 为这个门户渲染内容（传递观察方向）
-        RenderPortalContent(portal, viewMatrix, projectionMatrix, cameraPos, 
+        // 为这个门户渲染内容（传递观察方向，并传递排除门户以供下一层递归使用）
+        RenderPortalContent(portal, viewMatrix, projectionMatrix, actualCameraPos, 
                            recursionLevel, stencilValue + (int)i + 1, currentTime, viewingSide);
     }
 }
@@ -867,6 +909,13 @@ void RenderPortalContent(PortalRenderer::Portal* portal,
                          float currentTime,
                          int viewingSide) {
     
+    // RenderDoc 调试标记
+    char debugName[128];
+    glm::vec3 portalPos = glm::vec3(portal->transform[3]);
+    snprintf(debugName, sizeof(debugName), "Portal L%d @ (%.1f, %.1f, %.1f) Stencil=%d", 
+             recursionLevel, portalPos.x, portalPos.y, portalPos.z, stencilValue);
+    PushDebugGroup(debugName);
+    
     PortalRenderer::Portal* destPortal = portal->linkedPortal;
     
     // 双面门户：根据观察方向调整入口门户的变换
@@ -877,17 +926,20 @@ void RenderPortalContent(PortalRenderer::Portal* portal,
         effectiveSrcTransform = portal->transform * glm::rotate(glm::mat4(1.0f), glm::radians(180.0f), glm::vec3(0, 1, 0));
     }
     
-    // 调试输出
-    if (g_DebugThisFrame && recursionLevel == 0) {
+    // 调试输出（所有递归层级）
+    if (g_DebugThisFrame) {
         glm::vec3 portalPos = glm::vec3(portal->transform[3]);
         glm::vec3 destPos = glm::vec3(destPortal->transform[3]);
         glm::vec3 portalNormal = glm::vec3(portal->transform * glm::vec4(0, 0, 1, 0));
-        std::cout << "[Portal Debug] Rendering portal at (" << portalPos.x << ", " << portalPos.y << ", " << portalPos.z << ")" << std::endl;
+        std::cout << "[Portal Debug L" << recursionLevel << "] Rendering portal at (" << portalPos.x << ", " << portalPos.y << ", " << portalPos.z << ")" << std::endl;
         std::cout << "  -> Normal: (" << portalNormal.x << ", " << portalNormal.y << ", " << portalNormal.z << ")" << std::endl;
         std::cout << "  -> Viewing side: " << (viewingSide > 0 ? "FRONT" : "BACK") << std::endl;
         std::cout << "  -> Destination: (" << destPos.x << ", " << destPos.y << ", " << destPos.z << ")" << std::endl;
-        std::cout << "  -> Camera pos: (" << cameraPos.x << ", " << cameraPos.y << ", " << cameraPos.z << ")" << std::endl;
+        std::cout << "  -> Camera pos (passed): (" << cameraPos.x << ", " << cameraPos.y << ", " << cameraPos.z << ")" << std::endl;
         std::cout << "  -> Stencil value: " << stencilValue << std::endl;
+        // 从view matrix提取相机位置
+        glm::vec3 camFromView = glm::vec3(glm::inverse(viewMatrix)[3]);
+        std::cout << "  -> Camera pos (from viewMatrix): (" << camFromView.x << ", " << camFromView.y << ", " << camFromView.z << ")" << std::endl;
     }
     
     // ========== 第1步：使用模板缓冲标记门户区域 ==========
@@ -928,9 +980,14 @@ void RenderPortalContent(PortalRenderer::Portal* portal,
     glm::mat4 virtualViewMatrix = PortalMath::CalculatePortalViewMatrix(
         viewMatrix, portal->transform, destPortal->transform);
     
-    // 计算虚拟相机位置（用于可见性检测和递归）
+    // 计算门户变换矩阵（用于将任何位置从入口侧映射到出口侧）
     glm::mat4 portalTransform = PortalMath::ComputePortalTransform(portal->transform, destPortal->transform);
-    glm::vec3 virtualCameraPos = glm::vec3(portalTransform * glm::vec4(cameraPos, 1.0f));
+    
+    // 从当前视图矩阵中提取相机位置（更准确，支持递归）
+    glm::vec3 currentCameraPos = glm::vec3(glm::inverse(viewMatrix)[3]);
+    
+    // 计算虚拟相机位置（用于可见性检测和递归）
+    glm::vec3 virtualCameraPos = glm::vec3(portalTransform * glm::vec4(currentCameraPos, 1.0f));
     
     // 调试：输出虚拟相机位置
     if (g_DebugThisFrame && recursionLevel == 0) {
@@ -1052,46 +1109,133 @@ void RenderPortalContent(PortalRenderer::Portal* portal,
     glStencilMask(0xFF);
     
     // ========== 第5步：渲染门户另一侧的场景（先天空盒，后几何体）==========
+    // 关键：必须保持模板测试启用，确保只渲染到门户区域内
+    // 模板测试已经在第4步设置为 GL_EQUAL stencilValue
+    glEnable(GL_STENCIL_TEST);
+    glStencilFunc(GL_EQUAL, stencilValue, 0xFF);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    glStencilMask(0x00);  // 不修改模板值
+    
     // 先渲染天空盒作为背景
     RenderSkybox(virtualViewMatrix, virtualProjection, currentTime);
     
     // 再渲染场景几何体
     RenderScene(virtualViewMatrix, virtualProjection);
     
+    // 渲染门户边框（作为场景的一部分，使用虚拟视图矩阵）
+    // 但要排除当前正在通过的门户对的边框
+    RenderPortalFramesExcluding(virtualViewMatrix, virtualProjection, currentTime, portal);
+    
     // ========== 第6步：递归渲染更深层的门户 ==========
-    glm::vec3 virtualCameraForward = glm::normalize(glm::vec3(portalTransform * glm::vec4(0, 0, -1, 0)));
+    // 从虚拟视图矩阵中提取相机前向向量（视图矩阵的第三行取反）
+    glm::mat4 invVirtualView = glm::inverse(virtualViewMatrix);
+    glm::vec3 virtualCameraForward = -glm::normalize(glm::vec3(invVirtualView[2]));
+    
+    // 关键修复：在递归时排除当前门户对
+    // 当通过门户A->B时，在L1层级不应该再渲染A或B
+    // 这样可以避免在不存在门户的位置看到错误的门户
     RenderPortalsRecursive(virtualViewMatrix, virtualProjection, virtualCameraPos, 
-                          virtualCameraForward, recursionLevel + 1, stencilValue, currentTime);
+                          virtualCameraForward, recursionLevel + 1, stencilValue, currentTime, portal);
+    
+    // ========== 第6.5步：封住门户深度 ==========
+    // 关键修复：渲染完门户内容后，将门户表面的深度写入深度缓冲
+    // 这样后续渲染的其他门户（如Portal 2）就不会覆盖当前门户（Portal 1）
+    // 门户表面作为一个"实体"存在于场景中，后面的内容会被它遮挡
+    PushDebugGroup("Seal Portal Depth");
+    
+    glEnable(GL_STENCIL_TEST);
+    glStencilFunc(GL_EQUAL, stencilValue, 0xFF);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    glStencilMask(0x00);  // 不修改模板值
+    
+    // 只写入深度，不写入颜色
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glDepthMask(GL_TRUE);
+    glDepthFunc(GL_ALWAYS);  // 强制写入深度
+    glDisable(GL_CULL_FACE);
+    
+    // 使用当前视图矩阵（不是虚拟视图矩阵）绘制门户表面
+    // 这样深度值对应门户在主场景中的真实位置
+    glUseProgram(g_SceneShader);
+    glm::mat4 sealMVP = projectionMatrix * viewMatrix * portal->transform;
+    glUniformMatrix4fv(glGetUniformLocation(g_SceneShader, "uMVP"), 1, GL_FALSE, glm::value_ptr(sealMVP));
+    
+    glBindVertexArray(g_PortalSurfaceVAO);
+    glDrawArrays(GL_TRIANGLES, 0, g_PortalSurfaceVertCount);
+    
+    // 恢复状态
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthFunc(GL_LESS);
+    glEnable(GL_CULL_FACE);
+    glStencilMask(0xFF);
+    
+    PopDebugGroup();  // Seal Portal Depth
     
     // ========== 第7步：恢复模板状态 ==========
     glStencilFunc(GL_EQUAL, recursionLevel == 0 ? 0 : stencilValue - 1, 0xFF);
     glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
     
     glDisable(GL_STENCIL_TEST);
+    
+    PopDebugGroup(); // Portal content
 }
 
-// 渲染门户边框（在所有递归渲染完成后）
-// 双面门户：不再渲染背面遮挡板，两面都可以看到对面场景
-void RenderPortalFrames(const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix, float time) {
+// 渲染门户边框（排除特定门户对）
+// 用于递归渲染时，避免在门户内部看到正在穿越的门户对的边框
+void RenderPortalFramesExcluding(const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix, 
+                                  float time, PortalRenderer::Portal* excludePortal) {
     glUseProgram(g_SceneShader);
     
+    int renderedCount = 0;
     for (size_t i = 0; i < g_Portals.size(); i++) {
         PortalRenderer::Portal* portal = g_Portals[i];
+        
+        // 排除当前门户对（入口门户及其链接的出口门户）
+        if (excludePortal != nullptr) {
+            if (portal == excludePortal || portal == excludePortal->linkedPortal) {
+                if (g_DebugThisFrame) {
+                    glm::vec3 pos = glm::vec3(portal->transform[3]);
+                    std::cout << "  [FramesExcluding] Skipping portal at (" << pos.x << ", " << pos.y << ", " << pos.z << ")" << std::endl;
+                }
+                continue;
+            }
+        }
+        
         glm::mat4 mvp = projectionMatrix * viewMatrix * portal->transform;
         glUniformMatrix4fv(glGetUniformLocation(g_SceneShader, "uMVP"), 1, GL_FALSE, glm::value_ptr(mvp));
         
         // 渲染门户边框
         glBindVertexArray(g_PortalFrameVAO);
         glDrawArrays(GL_TRIANGLES, 0, g_PortalFrameVertCount);
-        
-        // 双面门户：不再需要背面遮挡板
-        // 两面都可以透过门户看到对面场景
+        renderedCount++;
+    }
+    
+    if (g_DebugThisFrame && excludePortal != nullptr) {
+        std::cout << "  [FramesExcluding] Rendered " << renderedCount << " portal frames" << std::endl;
     }
     
     glBindVertexArray(0);
 }
 
+// 渲染门户边框（在所有递归渲染完成后）
+// 双面门户：不再渲染背面遮挡板，两面都可以看到对面场景
+void RenderPortalFrames(const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix, float time) {
+    // 关键修复：门框应该只渲染在主场景区域（模板值为0）
+    // 不应该渲染在门户内部区域（模板值非0），否则会覆盖门户内容
+    glEnable(GL_STENCIL_TEST);
+    glStencilFunc(GL_EQUAL, 0, 0xFF);  // 只在模板值为0的区域渲染
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);  // 不修改模板值
+    glStencilMask(0x00);
+    
+    RenderPortalFramesExcluding(viewMatrix, projectionMatrix, time, nullptr);
+    
+    glDisable(GL_STENCIL_TEST);
+    glStencilMask(0xFF);
+}
+
 void RenderFrame() {
+    PushDebugGroup("Frame");
+    
     glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     
@@ -1117,18 +1261,28 @@ void RenderFrame() {
     }
     
     // ============ 第1步：渲染主场景 ============
+    PushDebugGroup("1. Main Scene");
     RenderScene(viewMatrix, projectionMatrix);
+    PopDebugGroup();
     
     // ============ 第2步：渲染天空盒（作为背景，在场景之后渲染）============
     // 使用 GL_LEQUAL 深度测试，天空盒只渲染在没有场景几何体的地方
+    PushDebugGroup("2. Main Skybox");
     RenderSkybox(viewMatrix, projectionMatrix, currentTime);
+    PopDebugGroup();
     
     // ============ 第3步：递归渲染门户内容 ============
     // 使用模板缓冲实现真正的"透视"效果
+    PushDebugGroup("3. Portal Recursive Rendering");
     RenderPortalsRecursive(viewMatrix, projectionMatrix, g_CameraPosition, front, 0, 0, currentTime);
+    PopDebugGroup();
     
     // ============ 第4步：渲染门户边框 ============
+    PushDebugGroup("4. Portal Frames (Main View)");
     RenderPortalFrames(viewMatrix, projectionMatrix, currentTime);
+    PopDebugGroup();
+    
+    PopDebugGroup(); // Frame
 }
 
 void Cleanup() {
