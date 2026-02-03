@@ -781,11 +781,72 @@ void RenderSkybox(const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix
 }
 
 // ============================================================================
-// 递归门户渲染系统
+// RTT (Render to Texture) 门户渲染系统
 // ============================================================================
 
 // 最大递归深度（门户中看门户的层数）
 const int MAX_PORTAL_RECURSION = 4;
+
+// 门户纹理着色器
+static GLuint g_PortalTextureShader = 0;
+
+const char* PORTAL_TEXTURE_VS = R"(
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aColor;
+uniform mat4 uMVP;
+
+out vec4 vScreenPos;  // 屏幕空间位置
+
+void main() {
+    gl_Position = uMVP * vec4(aPos, 1.0);
+    vScreenPos = gl_Position;
+}
+)";
+
+const char* PORTAL_TEXTURE_FS = R"(
+#version 330 core
+in vec4 vScreenPos;
+out vec4 FragColor;
+uniform sampler2D uPortalTexture;
+uniform float uTime;
+
+void main() {
+    // 使用屏幕空间坐标作为纹理坐标
+    // 因为 RTT 使用相同的投影，门户表面在屏幕上的位置对应纹理中相同的位置
+    vec2 ndc = vScreenPos.xy / vScreenPos.w;  // NDC: -1 to 1
+    vec2 texCoord = ndc * 0.5 + 0.5;          // 纹理坐标: 0 to 1
+    
+    vec4 color = texture(uPortalTexture, texCoord);
+    
+    // 边缘发光效果（基于门户局部坐标）
+    float edgeDist = max(abs(ndc.x), abs(ndc.y));
+    float edge = smoothstep(0.8, 1.0, edgeDist);
+    vec3 edgeGlow = vec3(0.2, 0.6, 1.0) * edge * 0.3;
+    
+    FragColor = vec4(color.rgb + edgeGlow, 1.0);
+}
+)";
+
+void CreatePortalTextureShader() {
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &PORTAL_TEXTURE_VS, nullptr);
+    glCompileShader(vs);
+    
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &PORTAL_TEXTURE_FS, nullptr);
+    glCompileShader(fs);
+    
+    g_PortalTextureShader = glCreateProgram();
+    glAttachShader(g_PortalTextureShader, vs);
+    glAttachShader(g_PortalTextureShader, fs);
+    glLinkProgram(g_PortalTextureShader);
+    
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    
+    std::cout << "Portal texture shader created." << std::endl;
+}
 
 // 计算斜裁剪投影矩阵 - 确保只渲染门户平面后面的内容
 glm::mat4 ComputeObliqueProjection(const glm::mat4& projection, const glm::vec4& clipPlane) {
@@ -1233,6 +1294,233 @@ void RenderPortalFrames(const glm::mat4& viewMatrix, const glm::mat4& projection
     glStencilMask(0xFF);
 }
 
+// ============================================================================
+// RTT 方案：渲染门户到纹理
+// ============================================================================
+
+// 获取门户标签（A, B, C...）
+char GetPortalLabel(PortalRenderer::Portal* portal) {
+    for (size_t i = 0; i < g_Portals.size(); i++) {
+        if (g_Portals[i] == portal) {
+            return 'A' + (char)i;
+        }
+    }
+    return '?';
+}
+
+// 渲染单个门户内容到其纹理（RTT 核心函数）
+void RenderPortalToTexture(PortalRenderer::Portal* portal,
+                           const glm::mat4& viewMatrix,
+                           const glm::mat4& projectionMatrix,
+                           const glm::vec3& cameraPos,
+                           const glm::vec3& cameraForward,
+                           int recursionLevel,
+                           float currentTime,
+                           PortalRenderer::Portal* excludePortal = nullptr) {
+    if (!portal->isActive || !portal->linkedPortal) return;
+    if (recursionLevel >= MAX_PORTAL_RECURSION) return;
+    
+    PortalRenderer::Portal* destPortal = portal->linkedPortal;
+    
+    char portalLabel = GetPortalLabel(portal);
+    char destLabel = GetPortalLabel(destPortal);
+    
+    // RenderDoc 调试标记
+    char debugName[128];
+    snprintf(debugName, sizeof(debugName), "RTT Portal %c->%c L%d", portalLabel, destLabel, recursionLevel);
+    PushDebugGroup(debugName);
+    
+    // ========== 第1步：计算虚拟相机 ==========
+    glm::mat4 virtualViewMatrix = PortalMath::CalculatePortalViewMatrix(
+        viewMatrix, portal->transform, destPortal->transform);
+    
+    glm::mat4 portalTransform = PortalMath::ComputePortalTransform(portal->transform, destPortal->transform);
+    glm::vec3 virtualCameraPos = glm::vec3(portalTransform * glm::vec4(cameraPos, 1.0f));
+    
+    // 从虚拟视图矩阵提取相机前向向量
+    glm::mat4 invVirtualView = glm::inverse(virtualViewMatrix);
+    glm::vec3 virtualCameraForward = -glm::normalize(glm::vec3(invVirtualView[2]));
+    
+    // ========== 第2步：计算斜裁剪投影矩阵 ==========
+    glm::mat4 virtualProjection = projectionMatrix;
+    
+    glm::vec3 destPortalPos = glm::vec3(destPortal->transform[3]);
+    glm::vec3 destPortalNormal = glm::normalize(glm::vec3(destPortal->transform * glm::vec4(0, 0, 1, 0)));
+    
+    glm::vec3 clipPosView = glm::vec3(virtualViewMatrix * glm::vec4(destPortalPos, 1.0f));
+    glm::vec3 clipNormalView = glm::normalize(glm::vec3(virtualViewMatrix * glm::vec4(destPortalNormal, 0.0f)));
+    
+    if (clipNormalView.z > 0.0f) {
+        clipNormalView = -clipNormalView;
+    }
+    
+    float clipD = -glm::dot(clipNormalView, clipPosView);
+    
+    // 跳过无效的渲染情况
+    if (clipD > -0.01f) {
+        PopDebugGroup();
+        return;
+    }
+    
+    glm::vec4 clipPlane(clipNormalView.x, clipNormalView.y, clipNormalView.z, clipD - 0.01f);
+    
+    if (glm::abs(clipNormalView.z) >= 0.05f) {
+        virtualProjection = PortalMath::CalculateObliqueProjectionMatrix(projectionMatrix, clipPlane);
+    }
+    
+    // 保存虚拟 VP 矩阵供门户表面渲染使用
+    portal->virtualVP = virtualProjection * virtualViewMatrix;
+    
+    // ========== 第3步：绑定门户的 FBO ==========
+    glBindFramebuffer(GL_FRAMEBUFFER, portal->renderFBO);
+    glViewport(0, 0, portal->textureWidth, portal->textureHeight);
+    glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    
+    // ========== 第4步：先递归渲染更深层的门户 ==========
+    for (size_t i = 0; i < g_Portals.size(); i++) {
+        PortalRenderer::Portal* childPortal = g_Portals[i];
+        
+        // 跳过当前门户对（入口和出口）
+        if (childPortal == portal || childPortal == destPortal) continue;
+        // 跳过上层排除的门户对
+        if (excludePortal != nullptr) {
+            if (childPortal == excludePortal || childPortal == excludePortal->linkedPortal) continue;
+        }
+        if (!childPortal->isActive || !childPortal->linkedPortal) continue;
+        
+        // 检查可见性
+        if (!IsPortalVisible(childPortal, virtualCameraPos, virtualCameraForward)) continue;
+        
+        // 递归渲染子门户到其纹理
+        RenderPortalToTexture(childPortal, virtualViewMatrix, virtualProjection,
+                             virtualCameraPos, virtualCameraForward,
+                             recursionLevel + 1, currentTime, portal);
+        
+        // 重新绑定当前门户的 FBO
+        glBindFramebuffer(GL_FRAMEBUFFER, portal->renderFBO);
+        glViewport(0, 0, portal->textureWidth, portal->textureHeight);
+    }
+    
+    // ========== 第5步：渲染场景到门户纹理 ==========
+    // 天空盒
+    RenderSkybox(virtualViewMatrix, virtualProjection, currentTime);
+    
+    // 场景几何体
+    RenderScene(virtualViewMatrix, virtualProjection);
+    
+    // 门户边框（排除当前门户对和上层排除的门户）
+    glUseProgram(g_SceneShader);
+    for (size_t i = 0; i < g_Portals.size(); i++) {
+        PortalRenderer::Portal* framePortal = g_Portals[i];
+        
+        // 跳过当前门户对
+        if (framePortal == portal || framePortal == destPortal) continue;
+        if (excludePortal != nullptr) {
+            if (framePortal == excludePortal || framePortal == excludePortal->linkedPortal) continue;
+        }
+        
+        glm::mat4 mvp = virtualProjection * virtualViewMatrix * framePortal->transform;
+        glUniformMatrix4fv(glGetUniformLocation(g_SceneShader, "uMVP"), 1, GL_FALSE, glm::value_ptr(mvp));
+        glBindVertexArray(g_PortalFrameVAO);
+        glDrawArrays(GL_TRIANGLES, 0, g_PortalFrameVertCount);
+    }
+    
+    // ========== 第6步：渲染子门户表面（使用子门户的纹理）==========
+    for (size_t i = 0; i < g_Portals.size(); i++) {
+        PortalRenderer::Portal* childPortal = g_Portals[i];
+        
+        // 跳过当前门户对
+        if (childPortal == portal || childPortal == destPortal) continue;
+        if (excludePortal != nullptr) {
+            if (childPortal == excludePortal || childPortal == excludePortal->linkedPortal) continue;
+        }
+        if (!childPortal->isActive || !childPortal->linkedPortal) continue;
+        
+        // 检查可见性
+        if (!IsPortalVisible(childPortal, virtualCameraPos, virtualCameraForward)) continue;
+        
+        // 渲染子门户表面，使用子门户的纹理
+        glUseProgram(g_PortalTextureShader);
+        glm::mat4 portalMVP = virtualProjection * virtualViewMatrix * childPortal->transform;
+        glUniformMatrix4fv(glGetUniformLocation(g_PortalTextureShader, "uMVP"), 1, GL_FALSE, glm::value_ptr(portalMVP));
+        glUniform1f(glGetUniformLocation(g_PortalTextureShader, "uTime"), currentTime);
+        
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, childPortal->renderTexture);
+        glUniform1i(glGetUniformLocation(g_PortalTextureShader, "uPortalTexture"), 0);
+        
+        glDisable(GL_CULL_FACE);
+        glBindVertexArray(g_PortalSurfaceVAO);
+        glDrawArrays(GL_TRIANGLES, 0, g_PortalSurfaceVertCount);
+        glEnable(GL_CULL_FACE);
+    }
+    
+    // 恢复默认 FBO
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+    
+    PopDebugGroup();
+}
+
+// RTT 主入口：渲染所有门户到纹理，然后在主场景中显示
+void RenderAllPortalsRTT(const glm::mat4& viewMatrix,
+                         const glm::mat4& projectionMatrix,
+                         const glm::vec3& cameraPos,
+                         const glm::vec3& cameraForward,
+                         float currentTime) {
+    // ========== 第一遍：渲染每个可见门户的内容到纹理 ==========
+    PushDebugGroup("RTT Pass");
+    
+    for (size_t i = 0; i < g_Portals.size(); i++) {
+        PortalRenderer::Portal* portal = g_Portals[i];
+        if (!portal->isActive || !portal->linkedPortal) continue;
+        
+        // 检查门户是否可见
+        if (!IsPortalVisible(portal, cameraPos, cameraForward)) continue;
+        
+        // 渲染门户内容到纹理（递归）
+        RenderPortalToTexture(portal, viewMatrix, projectionMatrix, 
+                             cameraPos, cameraForward, 0, currentTime);
+    }
+    
+    PopDebugGroup();
+    
+    // ========== 第二遍：在主视图中渲染门户表面 ==========
+    PushDebugGroup("Portal Surfaces");
+    
+    for (size_t i = 0; i < g_Portals.size(); i++) {
+        PortalRenderer::Portal* portal = g_Portals[i];
+        if (!portal->isActive || !portal->linkedPortal) continue;
+        
+        // 检查门户是否可见
+        if (!IsPortalVisible(portal, cameraPos, cameraForward)) continue;
+        
+        char debugName[64];
+        snprintf(debugName, sizeof(debugName), "Surface %c", GetPortalLabel(portal));
+        PushDebugGroup(debugName);
+        
+        // 渲染门户表面，使用门户的纹理
+        glUseProgram(g_PortalTextureShader);
+        glm::mat4 portalMVP = projectionMatrix * viewMatrix * portal->transform;
+        glUniformMatrix4fv(glGetUniformLocation(g_PortalTextureShader, "uMVP"), 1, GL_FALSE, glm::value_ptr(portalMVP));
+        glUniform1f(glGetUniformLocation(g_PortalTextureShader, "uTime"), currentTime);
+        
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, portal->renderTexture);
+        glUniform1i(glGetUniformLocation(g_PortalTextureShader, "uPortalTexture"), 0);
+        
+        glDisable(GL_CULL_FACE);
+        glBindVertexArray(g_PortalSurfaceVAO);
+        glDrawArrays(GL_TRIANGLES, 0, g_PortalSurfaceVertCount);
+        glEnable(GL_CULL_FACE);
+        
+        PopDebugGroup();
+    }
+    
+    PopDebugGroup();
+}
+
 void RenderFrame() {
     PushDebugGroup("Frame");
     
@@ -1265,21 +1553,26 @@ void RenderFrame() {
     RenderScene(viewMatrix, projectionMatrix);
     PopDebugGroup();
     
-    // ============ 第2步：渲染天空盒（作为背景，在场景之后渲染）============
-    // 使用 GL_LEQUAL 深度测试，天空盒只渲染在没有场景几何体的地方
+    // ============ 第2步：渲染天空盒 ============
     PushDebugGroup("2. Main Skybox");
     RenderSkybox(viewMatrix, projectionMatrix, currentTime);
     PopDebugGroup();
     
-    // ============ 第3步：递归渲染门户内容 ============
-    // 使用模板缓冲实现真正的"透视"效果
-    PushDebugGroup("3. Portal Recursive Rendering");
-    RenderPortalsRecursive(viewMatrix, projectionMatrix, g_CameraPosition, front, 0, 0, currentTime);
+    // ============ 第3步：RTT 渲染门户 ============
+    PushDebugGroup("3. RTT Portal Rendering");
+    RenderAllPortalsRTT(viewMatrix, projectionMatrix, g_CameraPosition, front, currentTime);
     PopDebugGroup();
     
     // ============ 第4步：渲染门户边框 ============
-    PushDebugGroup("4. Portal Frames (Main View)");
-    RenderPortalFrames(viewMatrix, projectionMatrix, currentTime);
+    PushDebugGroup("4. Portal Frames");
+    glUseProgram(g_SceneShader);
+    for (size_t i = 0; i < g_Portals.size(); i++) {
+        PortalRenderer::Portal* portal = g_Portals[i];
+        glm::mat4 mvp = projectionMatrix * viewMatrix * portal->transform;
+        glUniformMatrix4fv(glGetUniformLocation(g_SceneShader, "uMVP"), 1, GL_FALSE, glm::value_ptr(mvp));
+        glBindVertexArray(g_PortalFrameVAO);
+        glDrawArrays(GL_TRIANGLES, 0, g_PortalFrameVertCount);
+    }
     PopDebugGroup();
     
     PopDebugGroup(); // Frame
@@ -1359,6 +1652,7 @@ int main() {
     CreateSceneGeometry();
     CreatePortalVisuals();
     CreatePortalSurfaceShader();
+    CreatePortalTextureShader();
     CreateSkybox();
     SetupPortals();
     SetupPlayer();

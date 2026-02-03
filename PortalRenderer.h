@@ -53,6 +53,9 @@ struct Portal {
     int textureWidth = 1024;
     int textureHeight = 1024;
     
+    // RTT 渲染时使用的虚拟相机 VP 矩阵（用于纹理坐标计算）
+    glm::mat4 virtualVP = glm::mat4(1.0f);
+    
     // 门户着色器程序
     GLuint shaderProgram = 0;
     
